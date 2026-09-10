@@ -8,7 +8,8 @@ LSB, spectrogram, FFT, frames, streams, appended data), and writes everything
 into a single analysis directory plus a REPORT.txt summary.
 
 Usage:
-    python3 ctf-media.py FILE [options]
+    python3 ctf-media.py FILE [options]   (macOS/Linux)
+    python ctf-media.py FILE [options]    (Windows)
 
 Options:
     --outdir DIR         Analysis output directory (default: <file>_ctf_analysis next to FILE)
@@ -22,7 +23,9 @@ Options:
 
 import argparse
 import json
+import mimetypes
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -45,7 +48,22 @@ MAGIC_SIGNATURES = [
     ("ELF", b"\x7fELF"),
 ]
 
-TOOLS = ["file", "exiftool", "strings", "binwalk", "sox", "ffmpeg", "ffprobe", "steghide", "stegseek", "identify"]
+# mime type to report when `file` isn't installed and magic-byte sniffing is
+# the only option (Windows without a `file` port, minimal containers, etc.)
+MIME_BY_SIGNATURE = {
+    "JPEG": "image/jpeg",
+    "PNG": "image/png",
+    "GIF": "image/gif",
+    "PDF": "application/pdf",
+    "ZIP": "application/zip",
+    "RAR": "application/vnd.rar",
+    "7z": "application/x-7z-compressed",
+    "ELF": "application/x-executable",
+}
+
+# tools this script shells out to; "identify" also accepts ImageMagick v7's
+# `magick identify` form, checked separately in branch_image()
+TOOLS = ["file", "exiftool", "binwalk", "sox", "ffmpeg", "ffprobe", "steghide", "stegseek", "identify"]
 
 
 # --------------------------------------------------------------------------
@@ -80,6 +98,30 @@ def run(cmd, timeout=60, input_bytes=None):
 
 def write_text(path: Path, text: str):
     path.write_text(text, encoding="utf-8", errors="replace")
+
+
+def guess_mime(path: Path) -> str:
+    """Best-effort mime type when the `file` command isn't available (e.g.
+    plain Windows without a `file` port). Extension first, then magic bytes."""
+    mime, _ = mimetypes.guess_type(str(path))
+    if mime:
+        return mime
+    head = path.read_bytes()[:16]
+    for name, sig in MAGIC_SIGNATURES:
+        if head.startswith(sig):
+            return MIME_BY_SIGNATURE.get(name, "")
+    return ""
+
+
+def install_hint() -> str:
+    system = platform.system()
+    if system == "Darwin":
+        return "brew install <tool>"
+    if system == "Linux":
+        return "sudo apt-get install <tool>"
+    if system == "Windows":
+        return "choco install <tool> (or see README for winget/WSL options)"
+    return "install <tool> for your OS"
 
 
 def extract_strings(data: bytes, min_len=4):
@@ -130,13 +172,19 @@ def find_flags(text_blobs):
 
 def phase_identify(path: Path, outdir: Path, report):
     section("PHASE 1 - Identify")
-    ok, out, err = run(["file", str(path)])
-    ok2, mime, _ = run(["file", "--mime-type", "-b", str(path)])
-    text = f"$ file {path.name}\n{out}\n$ file --mime-type\n{mime}\n"
+    if which("file"):
+        ok, out, err = run(["file", str(path)])
+        ok2, mime, _ = run(["file", "--mime-type", "-b", str(path)])
+        mime = mime.strip()
+        out = out.strip()
+    else:
+        mime = guess_mime(path)
+        out = f"(`file` not available on this platform - guessed mime type from extension/magic bytes: {mime or 'unknown'})"
+    text = f"$ file {path.name}\n{out}\nmime-type: {mime}\n"
     print(text.strip())
     write_text(outdir / "01_identify.txt", text)
-    report["mime"] = mime.strip()
-    report["file_output"] = out.strip()
+    report["mime"] = mime
+    report["file_output"] = out
 
     data_head = path.read_bytes()[:16]
     matched = [name for name, sig in MAGIC_SIGNATURES if data_head.startswith(sig)]
@@ -154,7 +202,7 @@ def phase_identify(path: Path, outdir: Path, report):
 def phase_metadata(path: Path, outdir: Path, report):
     section("PHASE 2 - Metadata (exiftool)")
     if not which("exiftool"):
-        print("exiftool not installed - skipping. (brew install exiftool)")
+        print(f"exiftool not installed - skipping. ({install_hint().replace('<tool>', 'exiftool')})")
         return
     ok, out, err = run(["exiftool", "-a", "-u", "-g1", str(path)])
     write_text(outdir / "02_metadata.txt", out or err)
@@ -187,7 +235,7 @@ def phase_strings(path: Path, outdir: Path, report):
 def phase_binwalk(path: Path, outdir: Path, report, do_extract: bool, timeout: int):
     section("PHASE 4 - Embedded data (binwalk)")
     if not which("binwalk"):
-        print("binwalk not installed - skipping. (brew install binwalk)")
+        print(f"binwalk not installed - skipping. ({install_hint().replace('<tool>', 'binwalk')})")
         return
     ok, out, err = run(["binwalk", str(path)], timeout=timeout)
     write_text(outdir / "04_binwalk.txt", out or err)
@@ -250,7 +298,8 @@ def phase_steghide(path: Path, outdir: Path, report, wordlist: str, steg_pass: s
             lines.append("\n$ steghide extract (with provided pass)\n" + (out2 or err2))
             print((out2 or err2).strip())
     else:
-        lines.append("steghide not installed - skipping. (brew install steghide / port install steghide)")
+        lines.append(f"steghide not installed - skipping. Run python3 install.py for OS-specific pointers "
+                     f"({install_hint().replace('<tool>', 'steghide')}).")
         print(lines[-1])
 
     if wordlist:
@@ -292,7 +341,13 @@ def branch_image(path: Path, outdir: Path, report, timeout: int):
     img_dir.mkdir(exist_ok=True)
 
     if which("identify"):
-        ok, out, err = run(["identify", "-verbose", str(path)], timeout=timeout)
+        identify_cmd = ["identify", "-verbose", str(path)]
+    elif which("magick"):  # ImageMagick v7 on Windows ships `magick` only
+        identify_cmd = ["magick", "identify", "-verbose", str(path)]
+    else:
+        identify_cmd = None
+    if identify_cmd:
+        ok, out, err = run(identify_cmd, timeout=timeout)
         write_text(img_dir / "identify.txt", out or err)
         for line in (out or "").splitlines():
             if "Geometry" in line:
@@ -617,10 +672,14 @@ def main():
     section(f"ctf-media.py - analyzing {path.name}")
     print(f"Output directory: {outdir}")
 
-    missing = [t for t in TOOLS if not which(t)]
+    def tool_present(t):
+        return which(t) or (t == "identify" and which("magick"))
+
+    missing = [t for t in TOOLS if not tool_present(t)]
     if missing:
         print(f"Missing optional tools (some checks will be skipped): {', '.join(missing)}")
-        print("  brew install " + " ".join(m for m in missing if m != "strings"))
+        print(f"  Run `python3 install.py` from the repo root to install them ({platform.system()}),")
+        print(f"  or manually: {install_hint()}")
 
     report = {}
 
